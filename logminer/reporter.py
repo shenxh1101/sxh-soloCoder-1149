@@ -1,0 +1,82 @@
+import re
+from typing import Dict, List, Optional
+
+from .detector import AnomalyPoint
+from .context import ContextExtractor
+from .templater import Template
+
+
+SUGGESTION_RULES = [
+    (r"404", "404错误暴增，可能某个API端点被移除或URL路径变更"),
+    (r"500", "500错误暴增，可能后端服务出现异常（如数据库连接失败、内存溢出）"),
+    (r"502|503|504", "网关错误暴增，可能上游服务不可用或负载均衡配置问题"),
+    (r"403", "403错误暴增，可能权限配置变更或遭受扫描攻击"),
+    (r"401", "401错误暴增，可能认证服务异常或Token过期策略变更"),
+    (r"429", "429错误暴增，可能触发了限流策略或遭受DDoS攻击"),
+    (r"timeout|timed?\s*out", "超时日志暴增，可能网络延迟增大或下游服务响应变慢"),
+    (r"OOM|out\s+of\s+memory|memory", "内存相关错误暴增，可能存在内存泄漏"),
+    (r"connection\s*refused|connect\s*fail", "连接失败暴增，可能目标服务已停止或网络不通"),
+    (r"disk\s*full|no\s*space", "磁盘空间不足日志暴增，可能日志或数据未及时清理"),
+    (r"permission\s*denied", "权限拒绝日志暴增，可能文件/目录权限配置变更"),
+    (r"segmentation\s*fault|segfault", "段错误暴增，可能存在程序崩溃缺陷"),
+    (r"SSL|TLS|certificate", "SSL/TLS相关错误暴增，可能证书过期或配置错误"),
+    (r"CRITICAL|FATAL", "严重错误暴增，需立即排查"),
+    (r"ERROR", "错误日志暴增，需关注系统稳定性"),
+]
+
+
+class Reporter:
+    def __init__(self, context_extractor: ContextExtractor):
+        self.context_extractor = context_extractor
+
+    def _suggest(self, template: Template, anomaly: AnomalyPoint) -> str:
+        text = template.pattern.lower()
+        direction = "暴增" if anomaly.direction == "spike" else "骤降"
+        for pattern, suggestion in SUGGESTION_RULES:
+            if re.search(pattern, text, re.IGNORECASE):
+                time_str = anomaly.bucket_time.strftime("%H:%M")
+                return f"{suggestion}（{template.template_id}在{time_str}后{direction}）"
+        time_str = anomaly.bucket_time.strftime("%H:%M")
+        return f"模板{template.template_id}在{time_str}后频率{direction}，建议排查相关变更"
+
+    def generate_report(
+        self,
+        anomalies: List[AnomalyPoint],
+        all_entries: list,
+        template_entries: Dict[str, list],
+        templates: Dict[str, Template],
+        top_n: int = 20,
+    ) -> str:
+        lines = []
+        lines.append("=" * 70)
+        lines.append("  日志异常模式挖掘报告")
+        lines.append("=" * 70)
+        lines.append("")
+
+        if not anomalies:
+            lines.append("  未检测到异常模式。")
+            return "\n".join(lines)
+
+        lines.append(f"  检测到 {len(anomalies)} 个异常点（显示前 {top_n} 个）")
+        lines.append("")
+
+        for i, anomaly in enumerate(anomalies[:top_n], 1):
+            tmpl = anomaly.template
+            if not tmpl:
+                continue
+            lines.append(f"  [{i}] 模板ID: {anomaly.template_id}")
+            lines.append(f"      模板: {tmpl.pattern[:100]}")
+            lines.append(f"      时间: {anomaly.bucket_time}")
+            lines.append(f"      观测值: {anomaly.observed}  期望值: {anomaly.expected:.1f}")
+            lines.append(f"      异常分数: {anomaly.score:.2f}  方向: {anomaly.direction}")
+            lines.append(f"      可能原因: {self._suggest(tmpl, anomaly)}")
+
+            ctx = self.context_extractor.extract(anomaly, all_entries, template_entries)
+            ctx_text = self.context_extractor.format_context(ctx)
+            lines.append(ctx_text)
+            lines.append("")
+
+        lines.append("=" * 70)
+        lines.append("  报告结束")
+        lines.append("=" * 70)
+        return "\n".join(lines)

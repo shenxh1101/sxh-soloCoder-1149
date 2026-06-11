@@ -1,0 +1,50 @@
+log_formats:
+  - name: apache_combined
+    pattern: '^(?P<remote_host>\S+)\s+(?P<ident>\S+)\s+(?P<remote_user>\S+)\s+(?P<timestamp>\[.+?\])\s+"(?P<request>.+?)"\s+(?P<status>\d{3})\s+(?P<size>\S+)(?:\s+"(?P<referer>.+?)"\s+"(?P<user_agent>.+?)")?'
+    timestamp_field: timestamp
+    timestamp_format: "[%d/%b/%Y:%H:%M:%S %z]"
+
+  - name: nginx_combined
+    pattern: '^(?P<remote_addr>\S+)\s+-\s+(?P<remote_user>\S+)\s+(?P<timestamp>\[.+?\])\s+"(?P<request>.+?)"\s+(?P<status>\d{3})\s+(?P<body_bytes_sent>\S+)\s+"(?P<http_referer>.+?)"\s+"(?P<http_user_agent>.+?)"'
+    timestamp_field: timestamp
+    timestamp_format: "[%d/%b/%Y:%H:%M:%S %z]"
+
+  - name: syslog
+    pattern: '^(?P<timestamp>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<hostname>\S+)\s+(?P<program>[\w\-\.]+)(?:\[(?P<pid>\d+)\])?:\s+(?P<message>.*)$'
+    timestamp_field: timestamp
+    timestamp_format: "%b %d %H:%M:%S"
+
+  - name: application
+    pattern: '^(?P<timestamp>\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s*(?:\[?(?P<level>DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\]?)?\s*(?::?\s*(?P<logger>\S+))?\s*(?::?\s*(?P<message>.*))?$'
+    timestamp_field: timestamp
+    timestamp_format: "%Y-%m-%d %H:%M:%S"
+
+anomaly:
+  window_size: 5
+  threshold: 2.0
+  method: zscore
+  min_count: 3
+
+whitelist_templates:
+  - "GET <filepath> HTTP<filepath>"
+
+whitelist_patterns:
+  - "health.?check"
+  - "ping"
+
+context_lines: 5
+time_bucket_minutes: 5
+
+template_placeholders:
+  ipv4: '\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
+  ipv6: '\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b'
+  timestamp: '\b\d{4}[-/]\d{2}[-/]\d{2}[\sT]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b'
+  http_timestamp: '\[\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}\s[+-]\d{4}\]'
+  number_with_unit: '\b\d+(?:\.\d+)?(?:ms|s|KB|MB|GB|TB|KB|kb|mb|gb|tb|B|bps|K|M|G|Hz|kHz|MHz|GHz)\b'
+  hex: '\b0[xX][0-9a-fA-F]+\b'
+  uuid: '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+  filepath: '(?:/[\w\-\.]+)+'
+  url: 'https?://\S+'
+  email: '\b[\w\.-]+@[\w\.-]+\.\w+\b'
+  number: '\b\d+(?:\.\d+)?\b'
+  pid: '\[\d+\]'
