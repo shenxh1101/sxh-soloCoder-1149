@@ -36,8 +36,8 @@ class AnomalyDetector:
         self.bucket_minutes = bucket_minutes
 
     def _bucket_key(self, dt: datetime) -> datetime:
-        truncated = dt.replace(minute=(dt.minute // self.bucket_minutes) * self.bucket_minutes,
-                               second=0, microsecond=0)
+        minute = (dt.minute // self.bucket_minutes) * self.bucket_minutes
+        truncated = dt.replace(minute=minute, second=0, microsecond=0)
         return truncated
 
     def build_time_series(self, entries: List[LogEntry]) -> Dict[datetime, int]:
@@ -46,7 +46,8 @@ class AnomalyDetector:
             if entry.timestamp is None:
                 continue
             key = self._bucket_key(entry.timestamp)
-            series[key] = series.get(key, 0) + 1
+            key_naive = key.replace(tzinfo=None)
+            series[key_naive] = series.get(key_naive, 0) + 1
         return series
 
     def build_template_time_series(
@@ -58,7 +59,8 @@ class AnomalyDetector:
             if entry.timestamp is None:
                 continue
             key = self._bucket_key(entry.timestamp)
-            series[key] = series.get(key, 0) + 1
+            key_naive = key.replace(tzinfo=None)
+            series[key_naive] = series.get(key_naive, 0) + 1
         return series
 
     def _fill_missing_buckets(self, series: Dict[datetime, int]) -> Dict[datetime, int]:

@@ -7,12 +7,16 @@ from .templater import Template
 
 
 SUGGESTION_RULES = [
-    (r"404", "404错误暴增，可能某个API端点被移除或URL路径变更"),
-    (r"500", "500错误暴增，可能后端服务出现异常（如数据库连接失败、内存溢出）"),
-    (r"502|503|504", "网关错误暴增，可能上游服务不可用或负载均衡配置问题"),
-    (r"403", "403错误暴增，可能权限配置变更或遭受扫描攻击"),
-    (r"401", "401错误暴增，可能认证服务异常或Token过期策略变更"),
-    (r"429", "429错误暴增，可能触发了限流策略或遭受DDoS攻击"),
+    (r"\[404\]", "404错误暴增，可能某个API端点被移除或URL路径变更"),
+    (r"\[500\]", "500内部错误暴增，可能后端服务出现异常（如数据库连接失败、内存溢出）"),
+    (r"\[502\]", "502网关错误暴增，可能上游服务不可用或负载均衡配置问题"),
+    (r"\[503\]", "503服务不可用暴增，可能服务过载或已停机"),
+    (r"\[504\]", "504网关超时暴增，可能下游服务响应过慢或网络超时"),
+    (r"\[403\]", "403禁止访问暴增，可能权限配置变更或遭受扫描攻击"),
+    (r"\[401\]", "401未授权暴增，可能认证服务异常或Token过期策略变更"),
+    (r"\[429\]", "429限流错误暴增，可能触发了限流策略或遭受DDoS攻击"),
+    (r"\[ERROR\]|\[FATAL\]|\[CRITICAL\]", "严重错误日志暴增，需立即排查"),
+    (r"\[WARN\]|\[WARNING\]", "警告日志增多，需关注系统稳定性"),
     (r"timeout|timed?\s*out", "超时日志暴增，可能网络延迟增大或下游服务响应变慢"),
     (r"OOM|out\s+of\s+memory|memory", "内存相关错误暴增，可能存在内存泄漏"),
     (r"connection\s*refused|connect\s*fail", "连接失败暴增，可能目标服务已停止或网络不通"),
@@ -20,8 +24,6 @@ SUGGESTION_RULES = [
     (r"permission\s*denied", "权限拒绝日志暴增，可能文件/目录权限配置变更"),
     (r"segmentation\s*fault|segfault", "段错误暴增，可能存在程序崩溃缺陷"),
     (r"SSL|TLS|certificate", "SSL/TLS相关错误暴增，可能证书过期或配置错误"),
-    (r"CRITICAL|FATAL", "严重错误暴增，需立即排查"),
-    (r"ERROR", "错误日志暴增，需关注系统稳定性"),
 ]
 
 
@@ -29,15 +31,30 @@ class Reporter:
     def __init__(self, context_extractor: ContextExtractor):
         self.context_extractor = context_extractor
 
+    def _format_time(self, dt) -> str:
+        if dt is None:
+            return ""
+        try:
+            return dt.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+        except Exception:
+            return str(dt)
+
     def _suggest(self, template: Template, anomaly: AnomalyPoint) -> str:
-        text = template.pattern.lower()
+        text = template.pattern
         direction = "暴增" if anomaly.direction == "spike" else "骤降"
         for pattern, suggestion in SUGGESTION_RULES:
             if re.search(pattern, text, re.IGNORECASE):
-                time_str = anomaly.bucket_time.strftime("%H:%M")
+                time_str = self._format_time(anomaly.bucket_time)
                 return f"{suggestion}（{template.template_id}在{time_str}后{direction}）"
-        time_str = anomaly.bucket_time.strftime("%H:%M")
+        time_str = self._format_time(anomaly.bucket_time)
         return f"模板{template.template_id}在{time_str}后频率{direction}，建议排查相关变更"
+
+    def _status_label(self, template: Template) -> str:
+        if template.status_code:
+            return f"  状态码: {template.status_code}"
+        if template.level:
+            return f"  日志级别: {template.level}"
+        return ""
 
     def generate_report(
         self,
@@ -48,25 +65,30 @@ class Reporter:
         top_n: int = 20,
     ) -> str:
         lines = []
-        lines.append("=" * 70)
+        lines.append("=" * 72)
         lines.append("  日志异常模式挖掘报告")
-        lines.append("=" * 70)
+        lines.append("=" * 72)
         lines.append("")
 
         if not anomalies:
             lines.append("  未检测到异常模式。")
             return "\n".join(lines)
 
-        lines.append(f"  检测到 {len(anomalies)} 个异常点（显示前 {top_n} 个）")
+        total_error = sum(1 for a in anomalies if a.template and a.template.is_error())
+        lines.append(f"  检测到 {len(anomalies)} 个异常点（显示前 {top_n} 个，其中错误类 {total_error} 个）")
         lines.append("")
 
         for i, anomaly in enumerate(anomalies[:top_n], 1):
             tmpl = anomaly.template
             if not tmpl:
                 continue
-            lines.append(f"  [{i}] 模板ID: {anomaly.template_id}")
+            is_err = " [ERROR]" if tmpl.is_error() else ""
+            lines.append(f"  [{i}] 模板ID: {anomaly.template_id}{is_err}")
+            status_label = self._status_label(tmpl)
+            if status_label:
+                lines.append(f"      {status_label.strip()}")
             lines.append(f"      模板: {tmpl.pattern[:100]}")
-            lines.append(f"      时间: {anomaly.bucket_time}")
+            lines.append(f"      时间: {self._format_time(anomaly.bucket_time)}")
             lines.append(f"      观测值: {anomaly.observed}  期望值: {anomaly.expected:.1f}")
             lines.append(f"      异常分数: {anomaly.score:.2f}  方向: {anomaly.direction}")
             lines.append(f"      可能原因: {self._suggest(tmpl, anomaly)}")
@@ -76,7 +98,7 @@ class Reporter:
             lines.append(ctx_text)
             lines.append("")
 
-        lines.append("=" * 70)
+        lines.append("=" * 72)
         lines.append("  报告结束")
-        lines.append("=" * 70)
+        lines.append("=" * 72)
         return "\n".join(lines)

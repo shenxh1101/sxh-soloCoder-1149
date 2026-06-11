@@ -87,6 +87,23 @@ def build_parser() -> argparse.ArgumentParser:
                                  help="排序方式")
     template_parser.add_argument("--min-count", type=int, default=1,
                                  help="最小出现次数过滤")
+    template_parser.add_argument("--errors-only", action="store_true",
+                                 help="只显示错误类模板 (4xx/5xx/ERROR等)")
+
+    compare_parser = subparsers.add_parser("compare", help="对比两个时间段的模板频率变化")
+    compare_parser.add_argument("logfile", help="日志文件路径")
+    compare_parser.add_argument("-c", "--config", default=None, help="配置文件路径 (YAML)")
+    compare_parser.add_argument("-f", "--format", default=None,
+                                choices=["apache_combined", "nginx_combined", "syslog", "application"],
+                                help="指定日志格式")
+    compare_parser.add_argument("--period1-start", required=True, help="时间段1开始时间")
+    compare_parser.add_argument("--period1-end", required=True, help="时间段1结束时间")
+    compare_parser.add_argument("--period2-start", required=True, help="时间段2开始时间")
+    compare_parser.add_argument("--period2-end", required=True, help="时间段2结束时间")
+    compare_parser.add_argument("-n", "--top", type=int, default=10,
+                                help="显示前N个增长/下降模板")
+    compare_parser.add_argument("--errors-only", action="store_true",
+                                help="只对比错误类模板")
 
     return parser
 
@@ -235,16 +252,136 @@ def cmd_templates(args):
     all_templates = templater.get_all_templates()
     filtered = [t for t in all_templates if t.count >= args.min_count]
 
+    if hasattr(args, "errors_only") and args.errors_only:
+        filtered = [t for t in filtered if t.is_error()]
+
     if args.sort == "count":
         filtered.sort(key=lambda t: t.count, reverse=True)
     else:
         filtered.sort(key=lambda t: t.template_id)
 
-    print(f"{'ID':<10} {'Count':<10} {'Template'}")
-    print("-" * 80)
+    print(f"{'ID':<10} {'Count':<10} {'Status/Level':<14} {'Template'}")
+    print("-" * 90)
     for t in filtered:
         whitelisted = " [WL]" if templater.is_whitelisted(t.pattern) else ""
-        print(f"{t.template_id:<10} {t.count:<10} {t.pattern[:60]}{whitelisted}")
+        status_info = t.status_code or t.level or ""
+        is_err = " [ERR]" if t.is_error() else ""
+        print(f"{t.template_id:<10} {t.count:<10} {status_info:<14} {t.pattern[:55]}{whitelisted}{is_err}")
+
+
+def cmd_compare(args):
+    config = _load_and_apply_overrides(args)
+
+    p1_start = parse_datetime(args.period1_start)
+    p1_end = parse_datetime(args.period1_end)
+    p2_start = parse_datetime(args.period2_start)
+    p2_end = parse_datetime(args.period2_end)
+
+    if not all([p1_start, p1_end, p2_start, p2_end]):
+        print("错误：必须提供两个时间段的起止时间（--period1-start/end, --period2-start/end）")
+        return
+
+    log_parser = LogParser(config)
+    all_entries = log_parser.parse_file(args.logfile)
+
+    if not all_entries:
+        print("未找到日志条目。")
+        return
+
+    p1_entries = [e for e in all_entries if _in_range(e.timestamp, p1_start, p1_end)]
+    p2_entries = [e for e in all_entries if _in_range(e.timestamp, p2_start, p2_end)]
+
+    print(f"时间段1 ({args.period1_start} ~ {args.period1_end}): {len(p1_entries)} 条日志")
+    print(f"时间段2 ({args.period2_start} ~ {args.period2_end}): {len(p2_entries)} 条日志")
+    print()
+
+    templater1 = LogTemplater(config)
+    templater1.process_entries(p1_entries)
+
+    templater2 = LogTemplater(config)
+    templater2.process_entries(p2_entries)
+
+    p1_counts = {t.pattern: t.count for t in templater1.get_all_templates()}
+    p2_counts = {t.pattern: t.count for t in templater2.get_all_templates()}
+
+    all_patterns = set(p1_counts.keys()) | set(p2_counts.keys())
+
+    changes = []
+    for pat in all_patterns:
+        c1 = p1_counts.get(pat, 0)
+        c2 = p2_counts.get(pat, 0)
+        diff = c2 - c1
+        if c1 > 0:
+            ratio = (c2 - c1) / c1
+        elif c2 > 0:
+            ratio = float('inf')
+        else:
+            ratio = 0.0
+
+        tmpl_info = None
+        for t in templater2.get_all_templates():
+            if t.pattern == pat:
+                tmpl_info = t
+                break
+        if tmpl_info is None:
+            for t in templater1.get_all_templates():
+                if t.pattern == pat:
+                    tmpl_info = t
+                    break
+
+        if args.errors_only and tmpl_info and not tmpl_info.is_error():
+            continue
+
+        changes.append({
+            "pattern": pat,
+            "count1": c1,
+            "count2": c2,
+            "diff": diff,
+            "ratio": ratio,
+            "template": tmpl_info,
+        })
+
+    if not changes:
+        print("没有找到符合条件的模板。")
+        return
+
+    increases = sorted(changes, key=lambda x: (x["ratio"], x["diff"]), reverse=True)
+    decreases = sorted(changes, key=lambda x: (x["ratio"], x["diff"]))
+
+    top_n = args.top
+
+    print("=" * 80)
+    print(f"  增长最快的 {min(top_n, len(increases))} 个模板（时间段2 vs 时间段1）")
+    print("=" * 80)
+    print(f"  {'变化率':>8}  {'增减':>6}  {'P1计数':>8}  {'P2计数':>8}  模板")
+    print("-" * 80)
+    for c in increases[:top_n]:
+        ratio_str = f"{c['ratio']*100:.0f}%" if c['ratio'] != float('inf') else "NEW"
+        diff_str = f"+{c['diff']}" if c['diff'] >= 0 else str(c['diff'])
+        is_err = " [ERR]" if c['template'] and c['template'].is_error() else ""
+        print(f"  {ratio_str:>8}  {diff_str:>6}  {c['count1']:>8}  {c['count2']:>8}  {c['pattern'][:50]}{is_err}")
+
+    print()
+    print("=" * 80)
+    print(f"  下降最快的 {min(top_n, len(decreases))} 个模板（时间段2 vs 时间段1）")
+    print("=" * 80)
+    print(f"  {'变化率':>8}  {'增减':>6}  {'P1计数':>8}  {'P2计数':>8}  模板")
+    print("-" * 80)
+    for c in decreases[:top_n]:
+        if c['diff'] >= 0:
+            continue
+        ratio_str = f"{c['ratio']*100:.0f}%" if c['ratio'] != float('inf') else "N/A"
+        diff_str = f"+{c['diff']}" if c['diff'] >= 0 else str(c['diff'])
+        is_err = " [ERR]" if c['template'] and c['template'].is_error() else ""
+        print(f"  {ratio_str:>8}  {diff_str:>6}  {c['count1']:>8}  {c['count2']:>8}  {c['pattern'][:50]}{is_err}")
+    print()
+
+
+def _in_range(ts, start, end):
+    if ts is None:
+        return False
+    from .parser import _naive_compare
+    return _naive_compare(ts, start) >= 0 and _naive_compare(ts, end) <= 0
 
 
 def main():
@@ -261,6 +398,8 @@ def main():
         cmd_export(args)
     elif args.command == "templates":
         cmd_templates(args)
+    elif args.command == "compare":
+        cmd_compare(args)
 
 
 if __name__ == "__main__":
