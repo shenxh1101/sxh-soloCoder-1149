@@ -104,6 +104,11 @@ class Reporter:
 
         url_counter: Dict[str, int] = {}
         service_counter: Dict[str, int] = {}
+        url_status_counter: Dict[str, Dict[str, int]] = {}
+        service_err_counter: Dict[str, Dict[str, int]] = {}
+        level_counter: Dict[str, int] = {}
+        status_counter: Dict[str, int] = {}
+
         for tid, elist in template_entries.items():
             tmpl = None
             for _, t in elist:
@@ -112,32 +117,68 @@ class Reporter:
             if not tmpl:
                 continue
             total = len(elist)
-            status_info = tmpl.status_code or tmpl.level or ""
-            display = tmpl.pattern[:70]
+            is_err = tmpl.is_error()
+
             entry0 = elist[0][0]
-            request = entry0.fields.get("request", "") if entry0.fields else ""
+            fields = entry0.fields or {}
+
+            request = fields.get("request", "") if fields else ""
             if request:
                 parts = request.split()
                 if len(parts) >= 2:
                     path = parts[1].split("?")[0]
                     prefixes = path.strip("/").split("/")
                     if len(prefixes) >= 2:
-                        key = f"/{prefixes[0]}/{prefixes[1]}"
+                        url_key = f"/{prefixes[0]}/{prefixes[1]}"
                     else:
-                        key = f"/{prefixes[0]}" if prefixes else "/"
-                    if tmpl.is_error():
-                        url_counter[key] = url_counter.get(key, 0) + total
-            svc = entry0.fields.get("service") or entry0.fields.get("host") or ""
-            if svc and tmpl.is_error():
+                        url_key = f"/{prefixes[0]}" if prefixes else "/"
+                    if is_err:
+                        url_counter[url_key] = url_counter.get(url_key, 0) + total
+                        if url_key not in url_status_counter:
+                            url_status_counter[url_key] = {}
+                        sc = tmpl.status_code or tmpl.status_class or "OTHER"
+                        url_status_counter[url_key][sc] = url_status_counter[url_key].get(sc, 0) + total
+
+            svc = (fields.get("service") or fields.get("host") or
+                   fields.get("hostname") or fields.get("logger") or
+                   fields.get("program") or "")
+            if svc and is_err:
                 service_counter[svc] = service_counter.get(svc, 0) + total
+                if svc not in service_err_counter:
+                    service_err_counter[svc] = {}
+                label = tmpl.status_code or (f"[{tmpl.level}]" if tmpl.level else tmpl.pattern[:30])
+                service_err_counter[svc][label] = service_err_counter[svc].get(label, 0) + total
+
+            if tmpl.level and is_err:
+                level_counter[tmpl.level.upper()] = level_counter.get(tmpl.level.upper(), 0) + total
+            if tmpl.status_code and is_err:
+                status_counter[tmpl.status_code] = status_counter.get(tmpl.status_code, 0) + total
 
         top_urls = sorted(url_counter.items(), key=lambda x: x[1], reverse=True)[:5]
         top_services = sorted(service_counter.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        url_status_breakdown = []
+        for url, _ in top_urls:
+            dist = sorted(url_status_counter.get(url, {}).items(), key=lambda x: x[1], reverse=True)
+            url_status_breakdown.append((url, dist))
+
+        svc_err_breakdown = []
+        for svc, _ in top_services:
+            dist = sorted(service_err_counter.get(svc, {}).items(), key=lambda x: x[1], reverse=True)
+            svc_err_breakdown.append((svc, dist))
+
+        level_items = sorted(level_counter.items(), key=lambda x: x[1], reverse=True)
+        status_items = sorted(status_counter.items(), key=lambda x: x[1], reverse=True)
+
         return {
             "top_dangerous": top_dangerous,
             "longest": longest,
             "top_urls": top_urls,
             "top_services": top_services,
+            "url_status_breakdown": url_status_breakdown,
+            "svc_err_breakdown": svc_err_breakdown,
+            "level_counts": level_items,
+            "status_counts": status_items,
         }
 
     def _collect_anomaly_data(
@@ -157,8 +198,8 @@ class Reporter:
             ctx_lines = []
             if ctx.get("before"):
                 ctx_lines.extend([e.raw for e in ctx["before"]])
-            if ctx.get("anomaly"):
-                ctx_lines.extend([e.raw for e in ctx["anomaly"]])
+            if ctx.get("at"):
+                ctx_lines.extend([e.raw for e in ctx["at"]])
             if ctx.get("after"):
                 ctx_lines.extend([e.raw for e in ctx["after"]])
             rows.append({
@@ -247,6 +288,31 @@ class Reporter:
             for i, (svc, cnt) in enumerate(summary["top_services"], 1):
                 lines.append(f"     {i}. {svc:<40} 错误计数: {cnt}")
             lines.append("")
+
+        if summary["svc_err_breakdown"]:
+            lines.append("  📊 各服务内主要错误模板分布：")
+            for svc, dist in summary["svc_err_breakdown"]:
+                top_items = ", ".join(f"{k}={v}" for k, v in dist[:3])
+                lines.append(f"     - {svc:<38} {top_items}")
+            lines.append("")
+
+        if summary["url_status_breakdown"]:
+            lines.append("  🗂️ URL前缀的状态码分布（错误量最高的前缀）：")
+            for url, dist in summary["url_status_breakdown"]:
+                top_items = ", ".join(f"{k}={v}" for k, v in dist[:4])
+                lines.append(f"     - {url:<38} {top_items}")
+            lines.append("")
+
+        if summary["status_counts"] or summary["level_counts"]:
+            parts = []
+            if summary["status_counts"]:
+                parts.append("状态码: " + ", ".join(f"{k}={v}" for k, v in summary["status_counts"]))
+            if summary["level_counts"]:
+                parts.append("级别: " + ", ".join(f"{k}={v}" for k, v in summary["level_counts"]))
+            if parts:
+                lines.append("  📈 错误构成：" + "  |  ".join(parts))
+                lines.append("")
+
         lines.append("  " + "-" * 68)
         lines.append("")
 
@@ -329,6 +395,35 @@ class Reporter:
             for i, (svc, cnt) in enumerate(summary["top_services"], 1):
                 svc_csv = svc.replace('"', '""')
                 buf.write(f'{i},"{svc_csv}",{cnt}\n')
+
+        if summary["svc_err_breakdown"]:
+            buf.write("\n[各服务主要错误分布]\n")
+            buf.write("服务,错误类型1(计数),错误类型2(计数),错误类型3(计数)\n")
+            for svc, dist in summary["svc_err_breakdown"]:
+                svc_csv = svc.replace('"', '""')
+                parts = [f'{k}={v}' for k, v in dist[:3]]
+                while len(parts) < 3:
+                    parts.append("")
+                buf.write(f'"{svc_csv}",' + ",".join(f'"{p}"' for p in parts) + "\n")
+
+        if summary["url_status_breakdown"]:
+            buf.write("\n[URL前缀状态码分布]\n")
+            buf.write("URL前缀,状态码1(计数),状态码2(计数),状态码3(计数),状态码4(计数)\n")
+            for url, dist in summary["url_status_breakdown"]:
+                url_csv = url.replace('"', '""')
+                parts = [f'{k}={v}' for k, v in dist[:4]]
+                while len(parts) < 4:
+                    parts.append("")
+                buf.write(f'"{url_csv}",' + ",".join(f'"{p}"' for p in parts) + "\n")
+
+        if summary["status_counts"] or summary["level_counts"]:
+            buf.write("\n[错误构成汇总]\n")
+            if summary["status_counts"]:
+                pairs = ",".join(f'"{k}",{v}' for k, v in summary["status_counts"])
+                buf.write(f"状态码,{pairs}\n")
+            if summary["level_counts"]:
+                pairs = ",".join(f'"{k}",{v}' for k, v in summary["level_counts"])
+                buf.write(f"日志级别,{pairs}\n")
 
         buf.write("\n===== 异常详情 =====\n")
         fieldnames = [
@@ -438,6 +533,31 @@ class Reporter:
             for i, (svc, cnt) in enumerate(summary["top_services"], 1):
                 parts.append(f'<tr><td>{i}</td><td>{html_escape(svc)}</td><td>{cnt}</td></tr>')
             parts.append("</table>")
+
+        if summary["svc_err_breakdown"]:
+            parts.append("<p style='margin-top:14px;'><strong>📊 各服务内主要错误模板分布：</strong></p>")
+            parts.append('<table border="1" style="font-size:13px;border-collapse:collapse;"><tr style="background:#eee;"><th>服务</th><th>主要错误类型</th></tr>')
+            for svc, dist in summary["svc_err_breakdown"]:
+                top_items = ", ".join(f"{k}={v}" for k, v in dist[:3])
+                parts.append(f'<tr><td>{html_escape(svc)}</td><td>{html_escape(top_items)}</td></tr>')
+            parts.append("</table>")
+
+        if summary["url_status_breakdown"]:
+            parts.append("<p style='margin-top:14px;'><strong>🗂️ URL前缀的状态码分布（错误量最高的前缀）：</strong></p>")
+            parts.append('<table border="1" style="font-size:13px;border-collapse:collapse;"><tr style="background:#eee;"><th>URL前缀</th><th>状态码分布</th></tr>')
+            for url, dist in summary["url_status_breakdown"]:
+                top_items = ", ".join(f"{k}={v}" for k, v in dist[:4])
+                parts.append(f'<tr><td><code>{html_escape(url)}</code></td><td>{html_escape(top_items)}</td></tr>')
+            parts.append("</table>")
+
+        if summary["status_counts"] or summary["level_counts"]:
+            parts.append("<p style='margin-top:14px;'><strong>📈 错误构成：</strong> ")
+            bits = []
+            if summary["status_counts"]:
+                bits.append("状态码: " + ", ".join(f"{k}={v}" for k, v in summary["status_counts"]))
+            if summary["level_counts"]:
+                bits.append("级别: " + ", ".join(f"{k}={v}" for k, v in summary["level_counts"]))
+            parts.append("  |  ".join(bits) + "</p>")
 
         parts.append("</div>")
 

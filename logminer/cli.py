@@ -1,7 +1,7 @@
 import argparse
 import sys
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any, Tuple, Dict, List
 
 from .config import load_config, get_default_config, AppConfig
 from .parser import LogParser
@@ -144,6 +144,10 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="显示新增、长期高频、稳定变化的分类")
     compare_parser.add_argument("--postmortem", action="store_true",
                                 help="故障复盘视图：自动对比三组基线（前一天同窗口/历史均值/故障前1小时）并按四类分类")
+    compare_parser.add_argument("--export-report", action="store_true",
+                                help="故障复盘模式下导出复盘包（三组基线表+四类模板清单+上下文日志zip）")
+    compare_parser.add_argument("-o", "--output", default=None,
+                                help="复盘包输出文件路径前缀（默认 postmortem_report）")
 
     return parser
 
@@ -255,20 +259,23 @@ def cmd_analyze(args):
                     lines.append(f"状态码: {tmpl.status_code}")
                 if tmpl.level:
                     lines.append(f"日志级别: {tmpl.level}")
-                lines.append(f"异常时间: {anomaly.bucket_time}")
+                lines.append(f"异常时间桶: {anomaly.bucket_time}")
                 lines.append(f"观测值: {anomaly.observed}  期望值: {anomaly.expected:.1f}  异常分数: {anomaly.score:.2f}")
+                lines.append(f"方向: {anomaly.direction}")
                 lines.append(f"模板: {tmpl.pattern}")
                 lines.append("")
                 if ctx.get("before"):
-                    lines.append("--- 异常发生前 ---")
+                    lines.append(f"--- 异常点之前（{len(ctx['before'])}条）---")
                     for e in ctx["before"]:
                         lines.append(e.raw)
-                if ctx.get("anomaly"):
-                    lines.append("--- 异常点 ---")
-                    for e in ctx["anomaly"]:
+                if ctx.get("at"):
+                    lines.append("")
+                    lines.append(f"--- 异常点附近（{len(ctx['at'])}条，同模板±5分钟）---")
+                    for e in ctx["at"]:
                         lines.append(e.raw)
                 if ctx.get("after"):
-                    lines.append("--- 异常发生后 ---")
+                    lines.append("")
+                    lines.append(f"--- 异常点之后（{len(ctx['after'])}条）---")
                     for e in ctx["after"]:
                         lines.append(e.raw)
                 safe_id = anomaly.template_id.replace("/", "_").replace("\\", "_")
@@ -277,7 +284,8 @@ def cmd_analyze(args):
                 with open(fpath, "w", encoding="utf-8") as fc:
                     fc.write("\n".join(lines))
                 ctx_count += 1
-                manifest.append(f"{i:03d} | {anomaly.severity:<6} | {anomaly.template_id:<14} | {fname}")
+                sev_mark = f"[{anomaly.severity.upper()}]"
+                manifest.append(f"{i:03d} | {sev_mark:<8} | {anomaly.template_id:<14} | {fname}")
             zip_path = os.path.join(base_dir, f"{stem}_contexts.zip")
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for root, _, files in os.walk(ctx_dir):
@@ -470,9 +478,14 @@ def cmd_compare(args):
         target_desc = f"故障窗口 ({args.period2_start} ~ {args.period2_end})"
         p2_entries = [e for e in all_entries if _in_range(e.timestamp, p2_start, p2_end)]
         templater_p2 = LogTemplater(config)
-        templater_p2.process_entries(p2_entries)
+        template_entries_p2 = templater_p2.process_entries(p2_entries)
         p2_counts = {t.pattern: t.count for t in templater_p2.get_all_templates()}
         p2_tmpl = {t.pattern: t for t in templater_p2.get_all_templates()}
+        pattern_entries_p2: Dict[str, List[Tuple[Any, Any]]] = {}
+        for tid, lst in template_entries_p2.items():
+            if lst:
+                pat = lst[0][1].pattern
+                pattern_entries_p2[pat] = lst
 
         prev_day_start = p2_start - timedelta(days=1)
         prev_day_end = prev_day_start + duration
@@ -541,12 +554,13 @@ def cmd_compare(args):
                 if cur > 0 or prev_day > 0 or hist_avg > 0:
                     recovering_templates.append((pat, cur, prev_day, hist_avg, pre_hour, tmpl))
 
-        for title, bucket in [
-            ("🆕 新增模板（三组基线均为0，故障窗口首次出现）", new_templates),
-            ("📈 回升模板（比三组基线都明显升高）", rebound_templates),
-            ("🔥 持续高位（之前就高，故障期仍然高）", sustained_templates),
-            ("✅ 恢复下降（比基线明显降低）", recovering_templates),
-        ]:
+        buckets = [
+            ("new", "🆕 新增模板（三组基线均为0，故障窗口首次出现）", new_templates),
+            ("rebound", "📈 回升模板（比三组基线都明显升高）", rebound_templates),
+            ("sustained", "🔥 持续高位（之前就高，故障期仍然高）", sustained_templates),
+            ("recovering", "✅ 恢复下降（比基线明显降低）", recovering_templates),
+        ]
+        for tag, title, bucket in buckets:
             if not bucket:
                 continue
             bucket.sort(key=lambda x: x[1], reverse=True)
@@ -560,6 +574,119 @@ def cmd_compare(args):
                 ha_s = f"{ha:.1f}" if isinstance(ha, float) else str(ha)
                 print(f"  {cur:>6}  {pd:>6}  {ha_s:>6}  {ph:>6}  {pat[:44]}{is_err}")
             print()
+
+        if getattr(args, "export_report", False):
+            import os, zipfile
+            output_base = args.output or f"postmortem_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            base_dir = os.path.dirname(os.path.abspath(output_base)) or "."
+            stem = os.path.splitext(os.path.basename(output_base))[0]
+            out_dir = os.path.join(base_dir, stem)
+            os.makedirs(out_dir, exist_ok=True)
+
+            summary_path = os.path.join(out_dir, "00_SUMMARY.txt")
+            with open(summary_path, "w", encoding="utf-8") as fs:
+                fs.write("=" * 72 + "\n")
+                fs.write("  故障复盘报告\n")
+                fs.write("=" * 72 + "\n\n")
+                fs.write(f"故障窗口: {args.period2_start} ~ {args.period2_end} (时长: {duration})\n")
+                fs.write(f"基线对比: 前一天同时段 | 过去{num_days}天同窗口均值 | 故障前1小时\n")
+                fs.write(f"故障窗口日志数: {len(p2_entries)}\n")
+                fs.write(f"历史有效天数: {valid_days}/{num_days}\n\n")
+                for tag, title, bucket in buckets:
+                    if not bucket:
+                        continue
+                    bucket.sort(key=lambda x: x[1], reverse=True)
+                    fs.write("-" * 72 + "\n")
+                    fs.write(f"  {title}: {len(bucket)} 个\n")
+                    fs.write("-" * 72 + "\n")
+                    fs.write(f"  {'当前':>6}  {'前一天':>6}  {'历史均':>6}  {'前1h':>6}  模板\n")
+                    for item in bucket:
+                        pat, cur, pd, ha, ph, tmpl = item
+                        is_err = " [ERR]" if tmpl and tmpl.is_error() else ""
+                        ha_s = f"{ha:.1f}" if isinstance(ha, float) else str(ha)
+                        fs.write(f"  {cur:>6}  {pd:>6}  {ha_s:>6}  {ph:>6}  {pat}{is_err}\n")
+                    fs.write("\n")
+
+            baseline_path = os.path.join(out_dir, "01_BASELINES_COMPARISON.csv")
+            with open(baseline_path, "w", encoding="utf-8", newline="") as fb:
+                import csv
+                w = csv.writer(fb)
+                w.writerow(["分类", "模板", "当前故障窗口", "前一天同时段", "历史天均值", "故障前1小时",
+                            "状态码/级别", "错误类"])
+                for tag, title, bucket in buckets:
+                    bucket.sort(key=lambda x: x[1], reverse=True)
+                    for pat, cur, pd, ha, ph, tmpl in bucket:
+                        sc = (tmpl.status_code or tmpl.level or "") if tmpl else ""
+                        is_err = "是" if (tmpl and tmpl.is_error()) else "否"
+                        w.writerow([title, pat, cur, pd, ha, ph, sc, is_err])
+
+            templates_path = os.path.join(out_dir, "02_TEMPLATES_BY_CATEGORY.txt")
+            with open(templates_path, "w", encoding="utf-8") as ft:
+                for tag, title, bucket in buckets:
+                    if not bucket:
+                        continue
+                    bucket.sort(key=lambda x: x[1], reverse=True)
+                    ft.write(f"\n===== [{tag.upper()}] {title} =====\n")
+                    for pat, cur, pd, ha, ph, tmpl in bucket:
+                        ft.write(f"  - 当前={cur} 前一天={pd} 历史均={ha} 前1h={ph}  模板: {pat}\n")
+                        if tmpl:
+                            meta = []
+                            if tmpl.status_code:
+                                meta.append(f"status={tmpl.status_code}")
+                            if tmpl.level:
+                                meta.append(f"level={tmpl.level}")
+                            if meta:
+                                ft.write(f"    元信息: {' '.join(meta)}\n")
+                        ft.write("\n")
+
+            ctx_dir = os.path.join(out_dir, "contexts")
+            os.makedirs(ctx_dir, exist_ok=True)
+            ctx_count = 0
+            manifest = []
+            for tag, title, bucket in buckets:
+                bucket.sort(key=lambda x: x[1], reverse=True)
+                for idx, (pat, cur, pd, ha, ph, tmpl) in enumerate(bucket[:args.top], 1):
+                    if not tmpl:
+                        continue
+                    elist = pattern_entries_p2.get(pat, [])
+                    if not elist:
+                        continue
+                    lines = []
+                    lines.append(f"=== 上下文: {title} 排名#{idx} ===")
+                    lines.append(f"模板: {pat}")
+                    lines.append(f"故障窗口计数: {cur}  |  前一天={pd}  历史均值={ha}  故障前1h={ph}")
+                    if tmpl.status_code:
+                        lines.append(f"状态码: {tmpl.status_code}")
+                    if tmpl.level:
+                        lines.append(f"日志级别: {tmpl.level}")
+                    lines.append("")
+                    lines.append(f"--- 原始日志样例（该模板在故障窗口内的 {min(20, len(elist))} 条）---")
+                    for e, _ in elist[:20]:
+                        lines.append(e.raw)
+                    safe_id = (tmpl.template_id or pat[:20]).replace("/", "_").replace("\\", "_")
+                    fname = f"{tag}_{idx:03d}_{safe_id}.log"
+                    fpath = os.path.join(ctx_dir, fname)
+                    with open(fpath, "w", encoding="utf-8") as fc:
+                        fc.write("\n".join(lines))
+                    ctx_count += 1
+                    manifest.append(f"{tag:<10} #{idx:03d} | {tmpl.template_id or pat[:20]:<14} | {fname}")
+
+            if manifest:
+                manifest_path = os.path.join(ctx_dir, "000_MANIFEST.txt")
+                with open(manifest_path, "w", encoding="utf-8") as fm:
+                    fm.write("故障复盘上下文索引\n")
+                    fm.write("=" * 72 + "\n")
+                    fm.write("\n".join(manifest))
+
+            zip_path = os.path.join(base_dir, f"{stem}.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(out_dir):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        zf.write(fp, os.path.relpath(fp, out_dir))
+
+            print(f"\n复盘包已导出: 目录={out_dir}  ZIP={zip_path}  上下文文件数={ctx_count}")
+
         return
 
     if args.baseline:
@@ -786,13 +913,19 @@ def _filter_entries(entries, args):
         if hasattr(args, "url_prefix") and args.url_prefix:
             request = e.fields.get("request", "") or ""
             msg = e.message or ""
+            prefix = args.url_prefix.lstrip("/")
             parts = request.split()
-            path = parts[1] if len(parts) >= 2 else request
+            path = ""
+            if len(parts) >= 2:
+                path = parts[1].split("?")[0]
+            target_path = path.lstrip("/")
             hit = False
-            for candidate in (path, request, msg):
-                if candidate.startswith(args.url_prefix) or ("/" + args.url_prefix.lstrip("/")) in candidate:
-                    hit = True
-                    break
+            if target_path and target_path.startswith(prefix):
+                hit = True
+            elif path.startswith("/" + prefix):
+                hit = True
+            elif msg.startswith(prefix) or ("/" + prefix) in msg:
+                hit = True
             if not hit:
                 continue
         if hasattr(args, "status_class") and args.status_class:
