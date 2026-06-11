@@ -74,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="按应用日志级别过滤 (如 ERROR/WARN/INFO)")
     analyze_parser.add_argument("--errors-only", action="store_true",
                                 help="只看错误类日志 (4xx/5xx/ERROR等)")
+    analyze_parser.add_argument("--export-context", action="store_true",
+                                help="将每个异常的上下文原始日志打包保存（与报告同目录，按模板编号分文件）")
 
     export_parser = subparsers.add_parser("export", help="导出模板为正则表达式规则")
     export_parser.add_argument("logfile", help="日志文件路径")
@@ -140,6 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="历史均值基线的天数（默认7天）")
     compare_parser.add_argument("--show-categories", action="store_true",
                                 help="显示新增、长期高频、稳定变化的分类")
+    compare_parser.add_argument("--postmortem", action="store_true",
+                                help="故障复盘视图：自动对比三组基线（前一天同窗口/历史均值/故障前1小时）并按四类分类")
 
     return parser
 
@@ -229,6 +233,60 @@ def cmd_analyze(args):
             report = reporter.generate_report(
                 anomalies, entries, template_entries, templates_dict, top_n=args.top
             )
+
+        if getattr(args, "export_context", False):
+            import os, zipfile
+            output_base = args.output or f"logminer_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            base_dir = os.path.dirname(os.path.abspath(output_base)) or "."
+            stem = os.path.splitext(os.path.basename(output_base))[0]
+            ctx_dir = os.path.join(base_dir, f"{stem}_contexts")
+            os.makedirs(ctx_dir, exist_ok=True)
+            manifest = []
+            ctx_count = 0
+            for i, anomaly in enumerate(anomalies[:args.top], 1):
+                tmpl = anomaly.template
+                if not tmpl:
+                    continue
+                ctx = ctx_extractor.extract(anomaly, entries, template_entries)
+                lines = []
+                lines.append(f"=== 上下文详情 编号 [{i}] 模板ID: {anomaly.template_id} ===")
+                lines.append(f"严重程度: {anomaly.severity} ({anomaly.severity_score:.1f})")
+                if tmpl.status_code:
+                    lines.append(f"状态码: {tmpl.status_code}")
+                if tmpl.level:
+                    lines.append(f"日志级别: {tmpl.level}")
+                lines.append(f"异常时间: {anomaly.bucket_time}")
+                lines.append(f"观测值: {anomaly.observed}  期望值: {anomaly.expected:.1f}  异常分数: {anomaly.score:.2f}")
+                lines.append(f"模板: {tmpl.pattern}")
+                lines.append("")
+                if ctx.get("before"):
+                    lines.append("--- 异常发生前 ---")
+                    for e in ctx["before"]:
+                        lines.append(e.raw)
+                if ctx.get("anomaly"):
+                    lines.append("--- 异常点 ---")
+                    for e in ctx["anomaly"]:
+                        lines.append(e.raw)
+                if ctx.get("after"):
+                    lines.append("--- 异常发生后 ---")
+                    for e in ctx["after"]:
+                        lines.append(e.raw)
+                safe_id = anomaly.template_id.replace("/", "_").replace("\\", "_")
+                fname = f"{i:03d}_{safe_id}.log"
+                fpath = os.path.join(ctx_dir, fname)
+                with open(fpath, "w", encoding="utf-8") as fc:
+                    fc.write("\n".join(lines))
+                ctx_count += 1
+                manifest.append(f"{i:03d} | {anomaly.severity:<6} | {anomaly.template_id:<14} | {fname}")
+            zip_path = os.path.join(base_dir, f"{stem}_contexts.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(ctx_dir):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        zf.write(fp, os.path.relpath(fp, ctx_dir))
+                if manifest:
+                    zf.writestr("000_MANIFEST.txt", "\n".join(manifest))
+            print(f"\n上下文已打包保存: 目录={ctx_dir}  ZIP={zip_path}  文件数={ctx_count}")
 
         if report_format == "text":
             print(report)
@@ -333,6 +391,59 @@ def cmd_templates(args):
         print(f"{t.template_id:<10} {t.count:<10} {status_info:<14} {t.pattern[:55]}{whitelisted}{is_err}")
 
 
+def _compare_two_periods(config, all_entries, p1_start, p1_end, p2_start, p2_end,
+                        baseline_desc, target_desc, top_n, errors_only, args):
+    from datetime import timedelta
+    from collections import defaultdict
+
+    p1_entries = [e for e in all_entries if _in_range(e.timestamp, p1_start, p1_end)]
+    p2_entries = [e for e in all_entries if _in_range(e.timestamp, p2_start, p2_end)]
+
+    print(f"{baseline_desc}: {len(p1_entries)} 条日志")
+    print(f"{target_desc}: {len(p2_entries)} 条日志")
+    print()
+
+    templater1 = LogTemplater(config)
+    templater1.process_entries(p1_entries)
+
+    templater2 = LogTemplater(config)
+    templater2.process_entries(p2_entries)
+
+    p1_counts = {t.pattern: t.count for t in templater1.get_all_templates()}
+    p2_counts = {t.pattern: t.count for t in templater2.get_all_templates()}
+
+    p1_tmpl = {t.pattern: t for t in templater1.get_all_templates()}
+    p2_tmpl = {t.pattern: t for t in templater2.get_all_templates()}
+    total_p1 = sum(p1_counts.values()) if p1_counts else 1
+    total_p2 = sum(p2_counts.values()) if p2_counts else 1
+
+    all_patterns = set(p1_counts.keys()) | set(p2_counts.keys())
+    changes = []
+    for pat in all_patterns:
+        c1 = p1_counts.get(pat, 0)
+        c2 = p2_counts.get(pat, 0)
+        diff = c2 - c1
+        ratio = (c2 - c1) / c1 if c1 > 0 else (float('inf') if c2 > 0 else 0.0)
+        tmpl_info = p2_tmpl.get(pat) or p1_tmpl.get(pat)
+        if errors_only and tmpl_info and not tmpl_info.is_error():
+            continue
+        freq_p1 = c1 / total_p1 if total_p1 > 0 else 0
+        freq_p2 = c2 / total_p2 if total_p2 > 0 else 0
+        if c1 == 0 and c2 > 0:
+            category = "NEW"
+        elif freq_p1 > 0.05 and ratio > 0:
+            category = "HOT_GROW"
+        elif freq_p1 > 0.01:
+            category = "HIGH_FREQ"
+        else:
+            category = "NORMAL"
+        changes.append({
+            "pattern": pat, "count1": c1, "count2": c2, "diff": diff, "ratio": ratio,
+            "template": tmpl_info, "category": category, "freq1": freq_p1, "freq2": freq_p2,
+        })
+    return changes
+
+
 def cmd_compare(args):
     config = _load_and_apply_overrides(args)
     from datetime import timedelta
@@ -343,22 +454,242 @@ def cmd_compare(args):
     if not all([p2_start, p2_end]):
         print("错误：必须提供目标时间段（--period2-start/end）")
         return
+    duration = p2_end - p2_start
+
+    is_postmortem = getattr(args, "postmortem", False)
+
+    log_parser = LogParser(config)
+    all_entries = log_parser.parse_file(args.logfile)
+    if not all_entries:
+        print("未找到日志条目。")
+        return
+    all_entries = _filter_entries(all_entries, args)
+
+    if is_postmortem:
+        num_days = args.baseline_days
+        target_desc = f"故障窗口 ({args.period2_start} ~ {args.period2_end})"
+        p2_entries = [e for e in all_entries if _in_range(e.timestamp, p2_start, p2_end)]
+        templater_p2 = LogTemplater(config)
+        templater_p2.process_entries(p2_entries)
+        p2_counts = {t.pattern: t.count for t in templater_p2.get_all_templates()}
+        p2_tmpl = {t.pattern: t for t in templater_p2.get_all_templates()}
+
+        prev_day_start = p2_start - timedelta(days=1)
+        prev_day_end = prev_day_start + duration
+        pd_entries = [e for e in all_entries if _in_range(e.timestamp, prev_day_start, prev_day_end)]
+        templater_pd = LogTemplater(config)
+        templater_pd.process_entries(pd_entries)
+        pd_counts = {t.pattern: t.count for t in templater_pd.get_all_templates()}
+
+        hist_counts_total = {}
+        valid_days = 0
+        for d in range(1, num_days + 1):
+            day_start = p2_start - timedelta(days=d)
+            day_end = day_start + duration
+            day_entries = [e for e in all_entries if _in_range(e.timestamp, day_start, day_end)]
+            if len(day_entries) == 0:
+                continue
+            tpl = LogTemplater(config)
+            tpl.process_entries(day_entries)
+            valid_days += 1
+            for t in tpl.get_all_templates():
+                hist_counts_total[t.pattern] = hist_counts_total.get(t.pattern, 0) + t.count
+        hist_counts = {}
+        if valid_days > 0:
+            hist_counts = {pat: cnt / valid_days for pat, cnt in hist_counts_total.items()}
+            print(f"历史同窗口均值: 过去 {valid_days}/{num_days} 天有数据, 归一化除数={valid_days}")
+        else:
+            print(f"历史同窗口均值: 过去 {num_days} 天无同窗口数据")
+
+        prehour_start = p2_start - timedelta(hours=1)
+        prehour_end = p2_start
+        ph_entries = [e for e in all_entries if _in_range(e.timestamp, prehour_start, prehour_end)]
+        templater_ph = LogTemplater(config)
+        templater_ph.process_entries(ph_entries)
+        ph_counts = {t.pattern: t.count for t in templater_ph.get_all_templates()}
+
+        print()
+        print("=" * 80)
+        print(f"  故障复盘视图 — 故障窗口: {args.period2_start} ~ {args.period2_end} ({duration})")
+        print("=" * 80)
+        print()
+
+        all_pats = set(p2_counts.keys()) | set(pd_counts.keys()) | set(hist_counts.keys()) | set(ph_counts.keys())
+
+        new_templates, rebound_templates, sustained_templates, recovering_templates = [], [], [], []
+        for pat in all_pats:
+            cur = p2_counts.get(pat, 0)
+            prev_day = pd_counts.get(pat, 0)
+            hist_avg = hist_counts.get(pat, 0)
+            pre_hour = ph_counts.get(pat, 0)
+            baseline = max(prev_day, hist_avg, pre_hour, 1)
+
+            tmpl = p2_tmpl.get(pat)
+            if args.errors_only and tmpl and not tmpl.is_error():
+                continue
+
+            is_cur_high = cur > 0 and (cur >= 2 * baseline or (cur >= 5 and baseline <= 1))
+            prev_high = max(prev_day, hist_avg, pre_hour)
+
+            if prev_day == 0 and hist_avg == 0 and pre_hour == 0 and cur > 0:
+                new_templates.append((pat, cur, prev_day, hist_avg, pre_hour, tmpl))
+            elif cur > prev_day and cur > hist_avg and cur > pre_hour and cur > 0:
+                rebound_templates.append((pat, cur, prev_day, hist_avg, pre_hour, tmpl))
+            elif cur > 0 and is_cur_high and prev_high > baseline * 0.5:
+                sustained_templates.append((pat, cur, prev_day, hist_avg, pre_hour, tmpl))
+            elif cur < prev_day * 0.5 or cur < hist_avg * 0.5:
+                if cur > 0 or prev_day > 0 or hist_avg > 0:
+                    recovering_templates.append((pat, cur, prev_day, hist_avg, pre_hour, tmpl))
+
+        for title, bucket in [
+            ("🆕 新增模板（三组基线均为0，故障窗口首次出现）", new_templates),
+            ("📈 回升模板（比三组基线都明显升高）", rebound_templates),
+            ("🔥 持续高位（之前就高，故障期仍然高）", sustained_templates),
+            ("✅ 恢复下降（比基线明显降低）", recovering_templates),
+        ]:
+            if not bucket:
+                continue
+            bucket.sort(key=lambda x: x[1], reverse=True)
+            print("-" * 80)
+            print(f"  {title}: {len(bucket)} 个")
+            print("-" * 80)
+            print(f"  {'当前':>6}  {'前一天':>6}  {'历史均':>6}  {'前1h':>6}  模板")
+            for item in bucket[:args.top]:
+                pat, cur, pd, ha, ph, tmpl = item
+                is_err = " [ERR]" if tmpl and tmpl.is_error() else ""
+                ha_s = f"{ha:.1f}" if isinstance(ha, float) else str(ha)
+                print(f"  {cur:>6}  {pd:>6}  {ha_s:>6}  {ph:>6}  {pat[:44]}{is_err}")
+            print()
+        return
 
     if args.baseline:
-        duration = p2_end - p2_start
         if args.baseline == "prev_day":
             p1_start = p2_start - timedelta(days=1)
             p1_end = p1_start + duration
         elif args.baseline == "history_avg":
+            baseline_counts = {}
+            valid_days = 0
+            for d in range(1, args.baseline_days + 1):
+                day_start = p2_start - timedelta(days=d)
+                day_end = day_start + duration
+                day_entries = [e for e in all_entries if _in_range(e.timestamp, day_start, day_end)]
+                if not day_entries:
+                    continue
+                tpl = LogTemplater(config)
+                tpl.process_entries(day_entries)
+                valid_days += 1
+                for t in tpl.get_all_templates():
+                    baseline_counts[t.pattern] = baseline_counts.get(t.pattern, 0) + t.count
             p1_start = p2_start - timedelta(days=args.baseline_days)
             p1_end = p2_start
+            p1_entries = []
+            if valid_days > 0:
+                baseline_avg = {pat: cnt / valid_days for pat, cnt in baseline_counts.items()}
+                baseline_desc = f"过去{valid_days}/{args.baseline_days}天同窗口均值"
+                p2_entries_target = [e for e in all_entries if _in_range(e.timestamp, p2_start, p2_end)]
+                print(f"{baseline_desc}: 窗口大小={duration}, 归一化除数={valid_days}")
+                print(f"目标时间段 ({args.period2_start} ~ {args.period2_end}): {len(p2_entries_target)} 条日志")
+                print()
+
+                templater2 = LogTemplater(config)
+                templater2.process_entries(p2_entries_target)
+                p2_counts = {t.pattern: t.count for t in templater2.get_all_templates()}
+                p2_tmpl = {t.pattern: t for t in templater2.get_all_templates()}
+                p1_counts = baseline_avg
+                p1_tmpl = {}
+                total_p1 = sum(p1_counts.values()) if p1_counts else 1
+                total_p2 = sum(p2_counts.values()) if p2_counts else 1
+                all_patterns = set(p1_counts.keys()) | set(p2_counts.keys())
+                changes = []
+                for pat in all_patterns:
+                    c1 = p1_counts.get(pat, 0)
+                    c2 = p2_counts.get(pat, 0)
+                    diff = c2 - c1
+                    ratio = (c2 - c1) / c1 if c1 > 0 else (float('inf') if c2 > 0 else 0.0)
+                    tmpl_info = p2_tmpl.get(pat)
+                    if args.errors_only and tmpl_info and not tmpl_info.is_error():
+                        continue
+                    freq_p1 = c1 / total_p1 if total_p1 > 0 else 0
+                    freq_p2 = c2 / total_p2 if total_p2 > 0 else 0
+                    if c1 == 0 and c2 > 0:
+                        category = "NEW"
+                    elif freq_p1 > 0.05 and ratio > 0:
+                        category = "HOT_GROW"
+                    elif freq_p1 > 0.01:
+                        category = "HIGH_FREQ"
+                    else:
+                        category = "NORMAL"
+                    changes.append({
+                        "pattern": pat, "count1": c1, "count2": c2, "diff": diff, "ratio": ratio,
+                        "template": tmpl_info, "category": category, "freq1": freq_p1, "freq2": freq_p2,
+                    })
+                top_n = args.top
+                if args.show_categories:
+                    for cat, cat_name in [
+                        ("NEW", "新增模板（基线为0）"),
+                        ("HOT_GROW", "长期高频且显著增长"),
+                        ("HIGH_FREQ", "长期高频"),
+                        ("NORMAL", "其他变化"),
+                    ]:
+                        cat_items = [c for c in changes if c["category"] == cat and c["diff"] >= 0]
+                        if not cat_items:
+                            continue
+                        cat_items.sort(key=lambda x: (x["ratio"], x["diff"]), reverse=True)
+                        print("=" * 80)
+                        print(f"  {cat_name}: {len(cat_items)} 个")
+                        print("=" * 80)
+                        print(f"  {'变化率':>8}  {'增减':>8}  {'基线计数':>10}  {'目标计数':>10}  模板")
+                        print("-" * 80)
+                        for c in cat_items[:top_n]:
+                            ratio_str = f"{c['ratio']*100:.0f}%" if c['ratio'] != float('inf') else "NEW"
+                            diff_str = f"+{c['diff']:.0f}" if c['diff'] >= 0 else str(c['diff'])
+                            c1_str = f"{c['count1']:.1f}" if isinstance(c['count1'], float) else str(c['count1'])
+                            c2_str = f"{c['count2']:.1f}" if isinstance(c['count2'], float) else str(c['count2'])
+                            is_err = " [ERR]" if c['template'] and c['template'].is_error() else ""
+                            print(f"  {ratio_str:>8}  {diff_str:>8}  {c1_str:>10}  {c2_str:>10}  {c['pattern'][:48]}{is_err}")
+                        print()
+                    return
+                increases = sorted(changes, key=lambda x: (x["ratio"], x["diff"]), reverse=True)
+                decreases = sorted(changes, key=lambda x: (x["ratio"], x["diff"]))
+                print("=" * 80)
+                print(f"  增长最快的 {min(top_n, len(increases))} 个模板（目标 vs {baseline_desc}）")
+                print("=" * 80)
+                print(f"  {'变化率':>8}  {'增减':>8}  {'基线计数':>10}  {'目标计数':>10}  模板")
+                print("-" * 80)
+                for c in increases[:top_n]:
+                    ratio_str = f"{c['ratio']*100:.0f}%" if c['ratio'] != float('inf') else "NEW"
+                    diff_str = f"+{c['diff']:.0f}" if c['diff'] >= 0 else str(c['diff'])
+                    c1_str = f"{c['count1']:.1f}" if isinstance(c['count1'], float) else str(c['count1'])
+                    c2_str = f"{c['count2']:.1f}" if isinstance(c['count2'], float) else str(c['count2'])
+                    is_err = " [ERR]" if c['template'] and c['template'].is_error() else ""
+                    cat_tag = f" [{c['category']}]" if c['category'] in ("NEW", "HOT_GROW") else ""
+                    print(f"  {ratio_str:>8}  {diff_str:>8}  {c1_str:>10}  {c2_str:>10}  {c['pattern'][:48]}{is_err}{cat_tag}")
+                print()
+                print("=" * 80)
+                drops = [c for c in decreases if c['diff'] < 0]
+                print(f"  下降最快的 {min(top_n, len(drops))} 个模板（目标 vs {baseline_desc}）")
+                print("=" * 80)
+                print(f"  {'变化率':>8}  {'增减':>8}  {'基线计数':>10}  {'目标计数':>10}  模板")
+                print("-" * 80)
+                for c in decreases[:top_n]:
+                    if c['diff'] >= 0:
+                        continue
+                    ratio_str = f"{c['ratio']*100:.0f}%" if c['ratio'] != float('inf') else "N/A"
+                    diff_str = f"+{c['diff']:.0f}" if c['diff'] >= 0 else str(c['diff'])
+                    c1_str = f"{c['count1']:.1f}" if isinstance(c['count1'], float) else str(c['count1'])
+                    c2_str = f"{c['count2']:.1f}" if isinstance(c['count2'], float) else str(c['count2'])
+                    is_err = " [ERR]" if c['template'] and c['template'].is_error() else ""
+                    print(f"  {ratio_str:>8}  {diff_str:>8}  {c1_str:>10}  {c2_str:>10}  {c['pattern'][:48]}{is_err}")
+                print()
+                return
         else:
             p1_start = parse_datetime(args.period1_start)
             p1_end = parse_datetime(args.period1_end)
-        baseline_desc = {
+        baseline_desc_map = {
             "prev_day": f"前一天同时段 ({p1_start.strftime('%Y-%m-%d %H:%M:%S')} ~ {p1_end.strftime('%Y-%m-%d %H:%M:%S')})",
-            "history_avg": f"过去{args.baseline_days}天均值 ({p1_start.strftime('%Y-%m-%d %H:%M:%S')} ~ {p1_end.strftime('%Y-%m-%d %H:%M:%S')})",
-        }.get(args.baseline, "时间段1")
+            "history_avg": f"过去{args.baseline_days}天同窗口均值",
+        }
+        baseline_desc = baseline_desc_map.get(args.baseline, "时间段1")
     else:
         p1_start = parse_datetime(args.period1_start)
         p1_end = parse_datetime(args.period1_end)
@@ -367,91 +698,16 @@ def cmd_compare(args):
             return
         baseline_desc = "时间段1"
 
-    log_parser = LogParser(config)
-    all_entries = log_parser.parse_file(args.logfile)
-
-    if not all_entries:
-        print("未找到日志条目。")
-        return
-
-    all_entries = _filter_entries(all_entries, args)
-
-    p1_entries = [e for e in all_entries if _in_range(e.timestamp, p1_start, p1_end)]
-    p2_entries = [e for e in all_entries if _in_range(e.timestamp, p2_start, p2_end)]
-
-    print(f"{baseline_desc}: {len(p1_entries)} 条日志")
-    print(f"目标时间段 ({args.period2_start} ~ {args.period2_end}): {len(p2_entries)} 条日志")
-    print()
-
-    templater1 = LogTemplater(config)
-    templater1.process_entries(p1_entries)
-
-    templater2 = LogTemplater(config)
-    templater2.process_entries(p2_entries)
-
-    if args.baseline == "history_avg" and len(p1_entries) > 0:
-        num_days = max(1, (p2_start - p1_start).days)
-        p1_counts_raw = {t.pattern: t.count for t in templater1.get_all_templates()}
-        p1_counts = {pat: cnt / num_days for pat, cnt in p1_counts_raw.items()}
-        print(f"  (历史均值按 {num_days} 天归一化)")
-        print()
-    else:
-        p1_counts = {t.pattern: t.count for t in templater1.get_all_templates()}
-
-    p2_counts = {t.pattern: t.count for t in templater2.get_all_templates()}
-    all_patterns = set(p1_counts.keys()) | set(p2_counts.keys())
-
-    p1_tmpl = {t.pattern: t for t in templater1.get_all_templates()}
-    p2_tmpl = {t.pattern: t for t in templater2.get_all_templates()}
-
-    total_p1 = sum(p1_counts.values()) if p1_counts else 1
-    total_p2 = sum(p2_counts.values()) if p2_counts else 1
-
-    changes = []
-    for pat in all_patterns:
-        c1 = p1_counts.get(pat, 0)
-        c2 = p2_counts.get(pat, 0)
-        diff = c2 - c1
-        if c1 > 0:
-            ratio = (c2 - c1) / c1
-        elif c2 > 0:
-            ratio = float('inf')
-        else:
-            ratio = 0.0
-
-        tmpl_info = p2_tmpl.get(pat) or p1_tmpl.get(pat)
-
-        if args.errors_only and tmpl_info and not tmpl_info.is_error():
-            continue
-
-        freq_p1 = c1 / total_p1 if total_p1 > 0 else 0
-        freq_p2 = c2 / total_p2 if total_p2 > 0 else 0
-
-        if c1 == 0 and c2 > 0:
-            category = "NEW"
-        elif freq_p1 > 0.05 and ratio > 0:
-            category = "HOT_GROW"
-        elif freq_p1 > 0.01:
-            category = "HIGH_FREQ"
-        else:
-            category = "NORMAL"
-
-        changes.append({
-            "pattern": pat,
-            "count1": c1,
-            "count2": c2,
-            "diff": diff,
-            "ratio": ratio,
-            "template": tmpl_info,
-            "category": category,
-            "freq1": freq_p1,
-            "freq2": freq_p2,
-        })
-
+    changes = _compare_two_periods(
+        config, all_entries, p1_start, p1_end, p2_start, p2_end,
+        baseline_desc, f"目标时间段 ({args.period2_start} ~ {args.period2_end})",
+        args.top, args.errors_only, args
+    )
     if not changes:
         print("没有找到符合条件的模板。")
         return
 
+    top_n = args.top
     if args.show_categories:
         for cat, cat_name in [
             ("NEW", "新增模板（基线为0）"),
@@ -468,7 +724,7 @@ def cmd_compare(args):
             print("=" * 80)
             print(f"  {'变化率':>8}  {'增减':>8}  {'基线计数':>10}  {'目标计数':>10}  模板")
             print("-" * 80)
-            for c in cat_items[:args.top]:
+            for c in cat_items[:top_n]:
                 ratio_str = f"{c['ratio']*100:.0f}%" if c['ratio'] != float('inf') else "NEW"
                 diff_str = f"+{c['diff']:.0f}" if isinstance(c['diff'], float) and c['diff'] >= 0 else (f"+{c['diff']}" if c['diff'] >= 0 else str(c['diff']))
                 c1_str = f"{c['count1']:.1f}" if isinstance(c['count1'], float) else str(c['count1'])
@@ -481,10 +737,8 @@ def cmd_compare(args):
     increases = sorted(changes, key=lambda x: (x["ratio"], x["diff"]), reverse=True)
     decreases = sorted(changes, key=lambda x: (x["ratio"], x["diff"]))
 
-    top_n = args.top
-
     print("=" * 80)
-    print(f"  增长最快的 {min(top_n, len(increases))} 个模板（目标时间段 vs {baseline_desc}）")
+    print(f"  增长最快的 {min(top_n, len(increases))} 个模板（目标 vs {baseline_desc}）")
     print("=" * 80)
     print(f"  {'变化率':>8}  {'增减':>8}  {'基线计数':>10}  {'目标计数':>10}  模板")
     print("-" * 80)
@@ -498,8 +752,9 @@ def cmd_compare(args):
         print(f"  {ratio_str:>8}  {diff_str:>8}  {c1_str:>10}  {c2_str:>10}  {c['pattern'][:48]}{is_err}{cat_tag}")
 
     print()
+    drops = [c for c in decreases if c['diff'] < 0]
     print("=" * 80)
-    print(f"  下降最快的 {min(top_n, len([c for c in decreases if c['diff'] < 0]))} 个模板（目标时间段 vs {baseline_desc}）")
+    print(f"  下降最快的 {min(top_n, len(drops))} 个模板（目标 vs {baseline_desc}）")
     print("=" * 80)
     print(f"  {'变化率':>8}  {'增减':>8}  {'基线计数':>10}  {'目标计数':>10}  模板")
     print("-" * 80)
@@ -529,9 +784,16 @@ def _filter_entries(entries, args):
         if hasattr(args, "errors_only") and args.errors_only and not e.is_error():
             continue
         if hasattr(args, "url_prefix") and args.url_prefix:
-            request = e.fields.get("request", "")
+            request = e.fields.get("request", "") or ""
             msg = e.message or ""
-            if args.url_prefix not in request and args.url_prefix not in msg:
+            parts = request.split()
+            path = parts[1] if len(parts) >= 2 else request
+            hit = False
+            for candidate in (path, request, msg):
+                if candidate.startswith(args.url_prefix) or ("/" + args.url_prefix.lstrip("/")) in candidate:
+                    hit = True
+                    break
+            if not hit:
                 continue
         if hasattr(args, "status_class") and args.status_class:
             if args.status_class == "error":

@@ -28,7 +28,7 @@ class LogEntry:
     level: Optional[str] = None
 
     def is_error(self) -> bool:
-        if self.status_class in ("client_error", "server_error"):
+        if self.status_class in ("4xx", "5xx", "client_error", "server_error"):
             return True
         if self.level and self.level.upper() in ("ERROR", "FATAL", "CRITICAL"):
             return True

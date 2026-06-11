@@ -55,6 +55,11 @@ class Reporter:
         for pattern, suggestion in SUGGESTION_RULES:
             if re.search(pattern, text, re.IGNORECASE):
                 time_str = self._format_time(anomaly.bucket_time)
+                if anomaly.direction == "drop":
+                    if "暴增" in suggestion:
+                        suggestion = suggestion.replace("暴增", "异常波动")
+                    suggestion = suggestion.rstrip("），,。.")
+                    return f"{suggestion}（{template.template_id}在{time_str}后频率{direction}，可能问题缓解或流量转移）"
                 return f"{suggestion}（{template.template_id}在{time_str}后{direction}）"
         time_str = self._format_time(anomaly.bucket_time)
         return f"模板{template.template_id}在{time_str}后频率{direction}，建议排查相关变更"
@@ -69,6 +74,71 @@ class Reporter:
     def _severity_label(self, anomaly: AnomalyPoint) -> str:
         label, icon = SEVERITY_LABELS.get(anomaly.severity, ("未知", "⚪"))
         return f"  严重程度: {icon} {label} ({anomaly.severity_score:.1f})"
+
+    def _build_summary(self, anomalies: List[AnomalyPoint],
+                       template_entries: Dict[str, list]) -> Dict:
+        top_dangerous = []
+        for a in anomalies:
+            if a.template and a.template.is_error():
+                top_dangerous.append(a)
+            if len(top_dangerous) >= 5:
+                break
+
+        tid_first_seen = {}
+        tid_last_seen = {}
+        for tid, elist in template_entries.items():
+            times = [e[0].timestamp for e in elist if e[0].timestamp]
+            if times:
+                if tid not in tid_first_seen or min(times) < tid_first_seen[tid]:
+                    tid_first_seen[tid] = min(times)
+                if tid not in tid_last_seen or max(times) > tid_last_seen[tid]:
+                    tid_last_seen[tid] = max(times)
+        durations = []
+        for a in anomalies:
+            tid = a.template_id
+            if tid in tid_first_seen and tid in tid_last_seen:
+                dur_sec = (tid_last_seen[tid] - tid_first_seen[tid]).total_seconds()
+                durations.append((a, dur_sec))
+        durations.sort(key=lambda x: x[1], reverse=True)
+        longest = durations[:5]
+
+        url_counter: Dict[str, int] = {}
+        service_counter: Dict[str, int] = {}
+        for tid, elist in template_entries.items():
+            tmpl = None
+            for _, t in elist:
+                tmpl = t
+                break
+            if not tmpl:
+                continue
+            total = len(elist)
+            status_info = tmpl.status_code or tmpl.level or ""
+            display = tmpl.pattern[:70]
+            entry0 = elist[0][0]
+            request = entry0.fields.get("request", "") if entry0.fields else ""
+            if request:
+                parts = request.split()
+                if len(parts) >= 2:
+                    path = parts[1].split("?")[0]
+                    prefixes = path.strip("/").split("/")
+                    if len(prefixes) >= 2:
+                        key = f"/{prefixes[0]}/{prefixes[1]}"
+                    else:
+                        key = f"/{prefixes[0]}" if prefixes else "/"
+                    if tmpl.is_error():
+                        url_counter[key] = url_counter.get(key, 0) + total
+            svc = entry0.fields.get("service") or entry0.fields.get("host") or ""
+            if svc and tmpl.is_error():
+                service_counter[svc] = service_counter.get(svc, 0) + total
+
+        top_urls = sorted(url_counter.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_services = sorted(service_counter.items(), key=lambda x: x[1], reverse=True)[:5]
+        return {
+            "top_dangerous": top_dangerous,
+            "longest": longest,
+            "top_urls": top_urls,
+            "top_services": top_services,
+        }
 
     def _collect_anomaly_data(
         self,
@@ -142,6 +212,44 @@ class Reporter:
         )
         lines.append("")
 
+        summary = self._build_summary(anomalies, template_entries)
+
+        lines.append("  " + "-" * 68)
+        lines.append("  【排查摘要】建议按以下顺序优先处理")
+        lines.append("  " + "-" * 68)
+        if summary["top_dangerous"]:
+            lines.append("  🔥 最危险异常（5xx/ERROR类，按严重度排序前5）：")
+            for i, a in enumerate(summary["top_dangerous"], 1):
+                tmpl = a.template
+                sc = tmpl.status_code or tmpl.level or "-"
+                lines.append(f"     {i}. [{a.severity.upper()}] {a.template_id} | {sc} | 观测{a.observed}/期望{a.expected:.1f}")
+                lines.append(f"        模板: {tmpl.pattern[:70]}")
+            lines.append("")
+
+        if summary["longest"]:
+            lines.append("  ⏱️ 持续最久的异常（前5）：")
+            for i, (a, dur_s) in enumerate(summary["longest"], 1):
+                tmpl = a.template
+                dur_h = dur_s / 3600.0
+                dur_str = f"{dur_h:.1f}h" if dur_h >= 1 else f"{dur_s/60:.1f}min"
+                sc = tmpl.status_code or tmpl.level or "-"
+                lines.append(f"     {i}. 已持续 {dur_str} | {a.template_id} | {sc} | {tmpl.pattern[:55]}")
+            lines.append("")
+
+        if summary["top_urls"]:
+            lines.append("  🌐 影响最大的 URL 前缀（按错误累计量排序）：")
+            for i, (url, cnt) in enumerate(summary["top_urls"], 1):
+                lines.append(f"     {i}. {url:<40} 错误计数: {cnt}")
+            lines.append("")
+
+        if summary["top_services"]:
+            lines.append("  🖥️ 受影响的服务/主机（按错误累计量排序）：")
+            for i, (svc, cnt) in enumerate(summary["top_services"], 1):
+                lines.append(f"     {i}. {svc:<40} 错误计数: {cnt}")
+            lines.append("")
+        lines.append("  " + "-" * 68)
+        lines.append("")
+
         rows = self._collect_anomaly_data(anomalies, all_entries, template_entries, templates, top_n)
 
         for row in rows:
@@ -177,8 +285,52 @@ class Reporter:
         templates: Dict[str, Template],
         top_n: int = 20,
     ) -> str:
+        summary = self._build_summary(anomalies, template_entries)
         rows = self._collect_anomaly_data(anomalies, all_entries, template_entries, templates, top_n)
         buf = io.StringIO()
+
+        buf.write("===== 排查摘要 =====\n")
+        buf.write(f"异常总数,{len(anomalies)},显示前,{top_n}\n")
+        high = sum(1 for a in anomalies if a.severity == "high")
+        medium = sum(1 for a in anomalies if a.severity == "medium")
+        low = sum(1 for a in anomalies if a.severity == "low")
+        total_error = sum(1 for a in anomalies if a.template and a.template.is_error())
+        buf.write(f"严重度分布,严重={high},中等={medium},轻微={low},错误类={total_error}\n")
+
+        if summary["top_dangerous"]:
+            buf.write("\n[最危险异常 TOP5]\n")
+            buf.write("排名,严重程度,模板ID,状态码/级别,观测,期望,模板片段\n")
+            for i, a in enumerate(summary["top_dangerous"], 1):
+                tmpl = a.template
+                sc = tmpl.status_code or tmpl.level or "-"
+                pat = tmpl.pattern.replace('"', '""')[:100]
+                buf.write(f'{i},{a.severity},{a.template_id},{sc},{a.observed},{a.expected:.1f},"{pat}"\n')
+
+        if summary["longest"]:
+            buf.write("\n[持续最久异常 TOP5]\n")
+            buf.write("排名,持续时间,模板ID,状态码/级别,模板片段\n")
+            for i, (a, dur_s) in enumerate(summary["longest"], 1):
+                tmpl = a.template
+                dur_h = dur_s / 3600.0
+                dur_str = f"{dur_h:.1f}h" if dur_h >= 1 else f"{dur_s/60:.1f}min"
+                sc = tmpl.status_code or tmpl.level or "-"
+                pat = tmpl.pattern.replace('"', '""')[:100]
+                buf.write(f'{i},{dur_str},{a.template_id},{sc},"{pat}"\n')
+
+        if summary["top_urls"]:
+            buf.write("\n[影响最大URL前缀 TOP5]\n")
+            buf.write("排名,URL前缀,错误累计数\n")
+            for i, (url, cnt) in enumerate(summary["top_urls"], 1):
+                buf.write(f'{i},"{url}",{cnt}\n')
+
+        if summary["top_services"]:
+            buf.write("\n[受影响服务 TOP5]\n")
+            buf.write("排名,服务/主机,错误累计数\n")
+            for i, (svc, cnt) in enumerate(summary["top_services"], 1):
+                svc_csv = svc.replace('"', '""')
+                buf.write(f'{i},"{svc_csv}",{cnt}\n')
+
+        buf.write("\n===== 异常详情 =====\n")
         fieldnames = [
             "rank", "severity", "severity_score", "template_id", "is_error",
             "status_code", "status_class", "log_level", "pattern",
@@ -246,6 +398,47 @@ class Reporter:
             f'<span style="color:{sev_colors["low"]}">● 轻微 {low}</span>&nbsp;&nbsp;'
             f"<strong>错误类:</strong> {total_error}</p>"
         )
+
+        summary = self._build_summary(anomalies, template_entries)
+
+        parts.append('<hr style="margin:12px 0;"><h3 style="margin:4px 0;">🔍 排查摘要</h3>')
+        if summary["top_dangerous"]:
+            parts.append("<p><strong>🔥 最危险异常（5xx/ERROR，按严重度前5）：</strong></p>")
+            parts.append('<table border="1" style="font-size:13px;border-collapse:collapse;"><tr style="background:#eee;"><th>#</th><th>严重度</th><th>模板ID</th><th>状态码/级别</th><th>观测/期望</th><th>模板片段</th></tr>')
+            for i, a in enumerate(summary["top_dangerous"], 1):
+                tmpl = a.template
+                sc = html_escape(tmpl.status_code or tmpl.level or "-")
+                pat = html_escape(tmpl.pattern[:70])
+                color = sev_colors.get(a.severity, "#666")
+                parts.append(f'<tr><td>{i}</td><td style="color:{color};font-weight:bold;">{sev_labels.get(a.severity,"?")}</td><td>{html_escape(a.template_id)}</td><td>{sc}</td><td>{a.observed}/{a.expected:.1f}</td><td>{pat}</td></tr>')
+            parts.append("</table>")
+
+        if summary["longest"]:
+            parts.append("<p style='margin-top:14px;'><strong>⏱️ 持续最久的异常（前5）：</strong></p>")
+            parts.append('<table border="1" style="font-size:13px;border-collapse:collapse;"><tr style="background:#eee;"><th>#</th><th>持续时间</th><th>模板ID</th><th>状态码/级别</th><th>模板片段</th></tr>')
+            for i, (a, dur_s) in enumerate(summary["longest"], 1):
+                tmpl = a.template
+                dur_h = dur_s / 3600.0
+                dur_str = f"{dur_h:.1f}h" if dur_h >= 1 else f"{dur_s/60:.1f}min"
+                sc = html_escape(tmpl.status_code or tmpl.level or "-")
+                pat = html_escape(tmpl.pattern[:70])
+                parts.append(f'<tr><td>{i}</td><td>{dur_str}</td><td>{html_escape(a.template_id)}</td><td>{sc}</td><td>{pat}</td></tr>')
+            parts.append("</table>")
+
+        if summary["top_urls"]:
+            parts.append("<p style='margin-top:14px;'><strong>🌐 影响最大的 URL 前缀（按错误量前5）：</strong></p>")
+            parts.append('<table border="1" style="font-size:13px;border-collapse:collapse;"><tr style="background:#eee;"><th>#</th><th>URL前缀</th><th>错误累计</th></tr>')
+            for i, (url, cnt) in enumerate(summary["top_urls"], 1):
+                parts.append(f'<tr><td>{i}</td><td><code>{html_escape(url)}</code></td><td>{cnt}</td></tr>')
+            parts.append("</table>")
+
+        if summary["top_services"]:
+            parts.append("<p style='margin-top:14px;'><strong>🖥️ 受影响的服务/主机（前5）：</strong></p>")
+            parts.append('<table border="1" style="font-size:13px;border-collapse:collapse;"><tr style="background:#eee;"><th>#</th><th>服务/主机</th><th>错误累计</th></tr>')
+            for i, (svc, cnt) in enumerate(summary["top_services"], 1):
+                parts.append(f'<tr><td>{i}</td><td>{html_escape(svc)}</td><td>{cnt}</td></tr>')
+            parts.append("</table>")
+
         parts.append("</div>")
 
         for row in rows:
