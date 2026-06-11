@@ -23,6 +23,8 @@ class AnomalyPoint:
     expected: float
     score: float
     direction: str  # "spike" or "drop"
+    severity: str = "low"  # "high", "medium", "low"
+    severity_score: float = 0.0
 
 
 class AnomalyDetector:
@@ -149,5 +151,20 @@ class AnomalyDetector:
             for a in anomalies:
                 a.template_id = tid
                 a.template = tmpl
+                sev_score = 0.0
+                if tmpl.status_class == "5xx" or (tmpl.level and tmpl.level.upper() in ("ERROR", "FATAL", "CRITICAL")):
+                    sev_score += 50
+                elif tmpl.status_class == "4xx":
+                    sev_score += 25
+                growth = a.observed / max(a.expected, 1)
+                sev_score += min(growth * 10, 30)
+                sev_score += min(abs(a.score), 20)
+                a.severity_score = sev_score
+                if sev_score >= 60:
+                    a.severity = "high"
+                elif sev_score >= 30:
+                    a.severity = "medium"
+                else:
+                    a.severity = "low"
                 all_anomalies.append(a)
-        return sorted(all_anomalies, key=lambda x: abs(x.score), reverse=True)
+        return sorted(all_anomalies, key=lambda x: (-x.severity_score, abs(x.score)), reverse=False)

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>日志异常模式挖掘报告</title>
+<style>
+body { font-family: -apple-system, Arial, sans-serif; margin: 20px; }
+h1 { color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px; }
+.summary { background: #f8f9fa; padding: 12px; border-radius: 6px; margin-bottom: 20px; }
+.anomaly { border: 1px solid #dee2e6; border-radius: 6px; margin: 12px 0; overflow: hidden; }
+.anomaly-header { padding: 10px 14px; font-weight: bold; color: #fff; }
+.anomaly-body { padding: 12px 14px; }
+.meta { margin: 4px 0; font-size: 14px; }
+.pattern { font-family: Consolas, monospace; background: #f1f3f5; padding: 6px 8px; border-radius: 4px; margin: 8px 0; }
+.context { background: #fff3cd; padding: 8px 10px; border-radius: 4px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; margin-top: 8px; max-height: 240px; overflow-y: auto; }
+table { border-collapse: collapse; width: 100%; }
+</style>
+</head>
+<body>
+<h1>日志异常模式挖掘报告</h1>
+<div class="summary">
+<p><strong>异常总数:</strong> 4 (显示前 3 个)&nbsp;&nbsp;<strong>严重程度:</strong> <span style="color:#dc3545">● 严重 0</span>&nbsp;&nbsp;<span style="color:#ffc107">● 中等 4</span>&nbsp;&nbsp;<span style="color:#28a745">● 轻微 0</span>&nbsp;&nbsp;<strong>错误类:</strong> 4</p>
+</div>
+<div class="anomaly">
+<div class="anomaly-header" style="background:#ffc107;">[1] T0004 <span style="background:#dc3545;color:#fff;padding:1px 6px;border-radius:3px;font-size:12px;">ERROR</span> — 中等 (58.8)</div>
+<div class="anomaly-body">
+<div class="meta"><strong>状态码/级别:</strong> ERROR &nbsp;|&nbsp; <strong>时间:</strong> 2024-06-15 09:30:00 &nbsp;|&nbsp; <strong>观测/期望:</strong> 5 / 19.4 &nbsp;|&nbsp; <strong>分数:</strong> -6.17 (drop)</div>
+<div class="pattern"><strong>模板:</strong> [ERROR] Payment gateway timeout: order_id=&lt;number&gt;</div>
+<div class="meta"><strong>可能原因:</strong> 严重错误日志暴增，需立即排查（T0004在2024-06-15 09:30:00后骤降）</div>
+<div class="context"><strong>上下文示例:</strong>
+2024-06-15 09:29:00 [ERROR] payment.service: SSL handshake failed: certificate expired
+2024-06-15 09:29:00 [ERROR] payment.service: Connection refused to payment provider: port=8147
+2024-06-15 09:29:00 [ERROR] payment.service: Connection refused to payment provider: port=8263
+2024-06-15 09:29:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=22
+2024-06-15 09:29:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=44
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8763
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8411
+2024-06-15 09:30:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=325
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8888
+2024-06-15 09:30:00 [ERROR] payment.service: Payment gateway timeout: order_id=73790</div>
+</div></div>
+<div class="anomaly">
+<div class="anomaly-header" style="background:#ffc107;">[2] T0003 <span style="background:#dc3545;color:#fff;padding:1px 6px;border-radius:3px;font-size:12px;">ERROR</span> — 中等 (56.0)</div>
+<div class="anomaly-body">
+<div class="meta"><strong>状态码/级别:</strong> ERROR &nbsp;|&nbsp; <strong>时间:</strong> 2024-06-15 09:30:00 &nbsp;|&nbsp; <strong>观测/期望:</strong> 2 / 21.4 &nbsp;|&nbsp; <strong>分数:</strong> -5.07 (drop)</div>
+<div class="pattern"><strong>模板:</strong> [ERROR] SSL handshake failed: certificate expired</div>
+<div class="meta"><strong>可能原因:</strong> 严重错误日志暴增，需立即排查（T0003在2024-06-15 09:30:00后骤降）</div>
+<div class="context"><strong>上下文示例:</strong>
+2024-06-15 09:29:00 [ERROR] payment.service: SSL handshake failed: certificate expired
+2024-06-15 09:29:00 [ERROR] payment.service: Connection refused to payment provider: port=8147
+2024-06-15 09:29:00 [ERROR] payment.service: Connection refused to payment provider: port=8263
+2024-06-15 09:29:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=22
+2024-06-15 09:29:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=44
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8763
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8411
+2024-06-15 09:30:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=325
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8888
+2024-06-15 09:30:00 [ERROR] payment.service: Payment gateway timeout: order_id=73790</div>
+</div></div>
+<div class="anomaly">
+<div class="anomaly-header" style="background:#ffc107;">[3] T0001 <span style="background:#dc3545;color:#fff;padding:1px 6px;border-radius:3px;font-size:12px;">ERROR</span> — 中等 (55.4)</div>
+<div class="anomaly-body">
+<div class="meta"><strong>状态码/级别:</strong> ERROR &nbsp;|&nbsp; <strong>时间:</strong> 2024-06-15 09:30:00 &nbsp;|&nbsp; <strong>观测/期望:</strong> 6 / 22.0 &nbsp;|&nbsp; <strong>分数:</strong> -2.65 (drop)</div>
+<div class="pattern"><strong>模板:</strong> [ERROR] Connection refused to payment provider: port=&lt;number&gt;</div>
+<div class="meta"><strong>可能原因:</strong> 严重错误日志暴增，需立即排查（T0001在2024-06-15 09:30:00后骤降）</div>
+<div class="context"><strong>上下文示例:</strong>
+2024-06-15 09:29:00 [ERROR] payment.service: SSL handshake failed: certificate expired
+2024-06-15 09:29:00 [ERROR] payment.service: Connection refused to payment provider: port=8147
+2024-06-15 09:29:00 [ERROR] payment.service: Connection refused to payment provider: port=8263
+2024-06-15 09:29:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=22
+2024-06-15 09:29:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=44
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8763
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8411
+2024-06-15 09:30:00 [ERROR] payment.service: Transaction failed: insufficient funds account_id=325
+2024-06-15 09:30:00 [ERROR] payment.service: Connection refused to payment provider: port=8888
+2024-06-15 09:30:00 [ERROR] payment.service: Payment gateway timeout: order_id=73790</div>
+</div></div>
+</body></html>
